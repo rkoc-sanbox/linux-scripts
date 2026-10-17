@@ -1,0 +1,25 @@
+client
+dev tun
+proto tcp
+port 1194
+remote 193.222.135.29
+remote 212.77.106.24
+connect-retry 10
+connect-timeout 15
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+auth-user-pass
+ca ca.crt
+cert RadoslawKociubaWPM.crt
+key RadoslawKociubaWPM.key
+cipher AES-256-GCM
+verb 3
+script-security 2
+up /usr/local/bin/update-systemd-resolved
+up-restart
+down /usr/local/bin/update-systemd-resolved
+down-pre
+dhcp-option DOMAIN-ROUTE .
+#remote-cert-tls server

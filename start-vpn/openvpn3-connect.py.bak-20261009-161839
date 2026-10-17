@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Łączy VPN przez openvpn3 i sam odpowiada na pytania o login, hasło i hasło klucza.
+
+CLI openvpn3 (i nakładka openvpn2) zawsze pyta o dane interaktywnie, więc ten skrypt
+podaje je przez API D-Bus openvpn3 - tak samo jak robi to openvpn3-autoload.
+Działa na pierwszym planie; Ctrl+C rozłącza VPN.
+"""
+
+import argparse
+import signal
+import subprocess
+import sys
+import time
+
+import dbus
+import openvpn3
+from openvpn3.constants import ClientAttentionGroup, StatusMajor, StatusMinor
+
+_SESSION_NAME = "o2VPN (start-vpn.sh)"
+_READY_TIMEOUT_SECONDS = 60
+_FINAL_STATUSES = (
+    StatusMinor.CONN_FAILED,
+    StatusMinor.CONN_AUTH_FAILED,
+    StatusMinor.CONN_DISCONNECTED,
+    StatusMinor.CONN_DONE,
+)
+
+
+def read_answers(auth_file, key_pass_file):
+    """read_answers czyta login i hasło (dwie linie) oraz hasło klucza prywatnego."""
+    with open(auth_file, encoding="utf-8") as auth:
+        user, password = auth.read().splitlines()[:2]
+
+    with open(key_pass_file, encoding="utf-8") as key_pass:
+        private_key_password = key_pass.read().splitlines()[0]
+
+    return {
+        ClientAttentionGroup.USER_PASSWORD: {"username": user, "password": password},
+        ClientAttentionGroup.PK_PASSPHRASE: private_key_password,
+    }
+
+
+def provide_credentials(session, answers):
+    """provide_credentials odpowiada na każde pytanie, które backend VPN ma w kolejce."""
+    for slot in session.FetchUserInputSlots():
+        group = slot.GetTypeGroup()[1]
+        variable = slot.GetVariableName()
+        if group == ClientAttentionGroup.PK_PASSPHRASE:
+            slot.ProvideInput(answers[group])
+            continue
+
+        if group == ClientAttentionGroup.USER_PASSWORD and variable in answers[group]:
+            slot.ProvideInput(answers[group][variable])
+            continue
+
+        raise RuntimeError(f"VPN pyta o dane, których skrypt nie zna: {slot.GetLabel()} ({variable})")
+
+
+def wait_until_ready(session, answers):
+    """wait_until_ready podaje dane logowania, dopóki backend nie będzie gotowy do połączenia."""
+    deadline = time.monotonic() + _READY_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            session.Ready()
+            return
+        except dbus.exceptions.DBusException as error:
+            message = str(error)
+            if " Missing user credentials" in message:
+                provide_credentials(session, answers)
+                continue
+
+            if "NoReply" in message or "Backend VPN process is not ready" in message:
+                time.sleep(1)
+                continue
+
+            raise
+
+    raise RuntimeError("backend VPN nie był gotowy w ciągu 60 s")
+
+
+def open_web_auth(url):
+    """open_web_auth otwiera stronę logowania SSO w domyślnej przeglądarce."""
+    if not url.startswith("https://"):
+        print(f"Pominięto nieoczekiwany adres logowania: {url}", flush=True)
+        return
+
+    print("Logowanie SSO - otwieram przeglądarkę (jeśli się nie otworzy, wejdź na adres powyżej).",
+          flush=True)
+    subprocess.run(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   check=False)
+
+
+def watch_connection(session):
+    """watch_connection wypisuje zmiany statusu, otwiera logowanie SSO i kończy się razem z
+    połączeniem."""
+    last_status = None
+    while True:
+        status = session.GetStatus()
+        current_status = (status["major"], status["minor"], status["message"])
+        if current_status != last_status:
+            print(f"Status: {status['minor'].name} {status['message']}".rstrip(), flush=True)
+            last_status = current_status
+            if status["major"] == StatusMajor.SESSION and status["minor"] == StatusMinor.SESS_AUTH_URL:
+                open_web_auth(status["message"])
+
+        if status["major"] == StatusMajor.SESSION and status["minor"] == StatusMinor.PROC_STOPPED:
+            return 1
+
+        if status["major"] == StatusMajor.CONNECTION and status["minor"] in _FINAL_STATUSES:
+            return 0 if status["minor"] in (StatusMinor.CONN_DISCONNECTED, StatusMinor.CONN_DONE) else 1
+
+        time.sleep(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", required=True, help="plik .ovpn z wbudowanymi certyfikatami")
+    parser.add_argument("--auth-user-pass", required=True, help="plik: login w 1. linii, hasło w 2.")
+    parser.add_argument("--askpass", required=True, help="plik z hasłem do klucza prywatnego")
+    args = parser.parse_args()
+
+    answers = read_answers(args.auth_user_pass, args.askpass)
+    with open(args.config, encoding="utf-8") as config:
+        config_text = config.read()
+
+    bus = dbus.SystemBus()
+    # single_use=True, persistent=False: openvpn3 usuwa konfigurację (z kluczem) po rozłączeniu.
+    configuration = openvpn3.ConfigurationManager(bus).Import(_SESSION_NAME, config_text, True, False)
+    session = openvpn3.SessionManager(bus).NewTunnel(configuration)
+
+    def disconnect(_signal_number, _frame):
+        print("\nRozłączanie VPN...", flush=True)
+        session.Disconnect()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, disconnect)
+    signal.signal(signal.SIGTERM, disconnect)
+
+    try:
+        wait_until_ready(session, answers)
+        session.Connect()
+    except Exception:
+        session.Disconnect()
+        raise
+
+    return watch_connection(session)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
